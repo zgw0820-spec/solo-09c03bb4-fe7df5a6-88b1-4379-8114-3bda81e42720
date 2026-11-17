@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 Scorer = Callable[[LinearBoWModel, str], Prediction]
 
 
+class ModelRetiredError(RuntimeError):
+    """Raised when a caller tries to submit work for a retired model version."""
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -96,6 +100,18 @@ class Worker:
         self._queues: dict[str, list[WorkItem]] = {}
         self._inflight: list[WorkItem] = []
         self._batch_tasks: set[asyncio.Task] = set()
+        # Model versions that must accept no new work (retiring or unloaded).
+        # Requests already accepted keep running to settlement as contracted.
+        self._blocked_versions: set[str] = set()
+        # Strong references to in-flight executor threads, keyed by request id
+        # and tagged with the pinned model version.  A thread whose request
+        # already timed out stays here until it actually returns, so
+        # retirement can wait for *late* threads too, not only for
+        # queued/executing requests.
+        self._scorer_threads: dict[str, tuple[str, asyncio.Future]] = {}
+        # Fired whenever any per-version activity disappears, so
+        # ``wait_drained`` returns promptly instead of polling.
+        self._drain_events: dict[str, asyncio.Event] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._closing = False
@@ -123,6 +139,7 @@ class Worker:
         # Rebind per-loop primitives so a stopped worker can be restarted on a
         # fresh event loop (e.g. between test clients).
         self._wake = asyncio.Event()
+        self._drain_events = {}
         self._batch_tasks.clear()
         self._task = asyncio.create_task(self._run(), name="moderation-worker")
         logger.info(
@@ -162,7 +179,77 @@ class Worker:
                     ),
                 )
         self._inflight.clear()
+        self._drain_events.clear()
         logger.info("worker stopped")
+
+    # ------------------------------------------------------------------
+    # retirement coordination
+    # ------------------------------------------------------------------
+    def block_version(self, version: str) -> None:
+        """Reject every future submission pinned to ``version``.
+
+        Already accepted work is untouched: it keeps the pinned version and
+        settles against its own deadline.
+        """
+        self._blocked_versions.add(version)
+        self._drain_event(version)
+        logger.info("model %s blocked for new submissions", version)
+
+    def unblock_version(self, version: str) -> None:
+        """Allow submissions again (used when test/fixture state is reset)."""
+        self._blocked_versions.discard(version)
+
+    def is_blocked(self, version: str) -> bool:
+        return version in self._blocked_versions
+
+    def _drain_event(self, version: str) -> asyncio.Event:
+        event = self._drain_events.get(version)
+        if event is None:
+            event = asyncio.Event()
+            self._drain_events[version] = event
+        return event
+
+    def _notify_drain(self, version: str) -> None:
+        event = self._drain_events.get(version)
+        if event is not None:
+            event.set()
+
+    def version_activity(self, version: str) -> dict[str, int]:
+        """Live counts of everything still touching a model version."""
+        queued = self.queued_count(version)
+        executing = sum(
+            1
+            for item in self._inflight
+            if item.model_version == version and not item.resolved
+        )
+        # Late threads: their requests are already resolved (typically a
+        # timeout) but the underlying scoring thread has not returned yet.
+        late = sum(
+            1
+            for thread_version, future in self._scorer_threads.values()
+            if thread_version == version and not future.done()
+        )
+        return {
+            "queued": queued,
+            "executing": executing,
+            "late_threads": late,
+            "total": queued + executing + late,
+        }
+
+    async def wait_drained(self, version: str) -> None:
+        """Block until no queued item, batch or late thread uses ``version``."""
+        event = self._drain_event(version)
+        while True:
+            if self.version_activity(version)["total"] == 0:
+                return
+            event.clear()
+            if self.version_activity(version)["total"] == 0:
+                return
+            # Poll as a safety net; normal exits are driven by the event.
+            try:
+                await asyncio.wait_for(event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
 
     def _unresolved(self) -> list[WorkItem]:
         seen: list[WorkItem] = []
@@ -188,6 +275,10 @@ class Worker:
         # Validate eagerly so a caller cannot pin an unknown model and the
         # timeout cannot be shorter/longer than the supported envelope.
         self.registry.get(model_version)
+        if model_version in self._blocked_versions:
+            raise ModelRetiredError(
+                f"model version {model_version!r} is retired and accepts no new requests"
+            )
         if not 100 <= int(deadline_ms) <= 1000:
             raise ValueError("deadline_ms must be within [100, 1000]")
 
@@ -505,12 +596,34 @@ class Worker:
         )
 
     async def _score_call(self, item: WorkItem, model: LinearBoWModel):
-        prediction = await asyncio.to_thread(self._scorer, model, item.text)
-        if item.simulated_latency_s > 0:
-            # Demo-only: emulate a slow inference call.  The deadline timer
-            # and wait_for above still fire on schedule.
-            await asyncio.sleep(item.simulated_latency_s)
-        return prediction
+        # Track the executor thread explicitly.  ``asyncio.wait_for`` below
+        # cancels the *await*, never the OS thread, so on a timeout the thread
+        # keeps running.  Keeping a strong reference plus a completion callback
+        # lets retirement wait it out, and lets the late result be discarded.
+        # The demo latency is injected *inside* the executor call so the whole
+        # slow window counts as a still-running scoring thread.
+        loop = asyncio.get_running_loop()
+
+        def _blocking_score() -> Prediction:
+            if item.simulated_latency_s > 0:
+                time.sleep(item.simulated_latency_s)
+            return self._scorer(model, item.text)
+
+        thread_future = loop.run_in_executor(None, _blocking_score)
+        self._scorer_threads[item.request_id] = (item.model_version, thread_future)
+
+        def _drop_thread(done: asyncio.Future) -> None:
+            self._scorer_threads.pop(item.request_id, None)
+            self._notify_drain(item.model_version)
+
+        thread_future.add_done_callback(_drop_thread)
+        # Shield the executor future from wait_for's cancellation: without
+        # this, Python 3.11 marks the future cancelled/done the moment the
+        # deadline expires, even though the underlying thread is still
+        # sleeping.  Retirement would then unload the model under a live
+        # thread.  The shield is what gets cancelled; the tracked future only
+        # completes when the thread truly returns.
+        return await asyncio.shield(thread_future)
 
     @staticmethod
     def _history_item(result: dict) -> dict:
@@ -595,6 +708,9 @@ class Worker:
             bucket[counts_key] += 1
         if not item.future.done():
             item.future.set_result(result)
+        # The item itself is gone; if the scoring thread is still running it
+        # remains in ``_scorer_threads`` until it returns.
+        self._notify_drain(item.model_version)
 
     # ------------------------------------------------------------------
     # introspection
@@ -623,9 +739,19 @@ class Worker:
         by_version: dict[str, int] = {}
         for item in pending:
             by_version[item.model_version] = by_version.get(item.model_version, 0) + 1
+        activity_versions = (
+            set(by_version)
+            | {thread_version for thread_version, _ in self._scorer_threads.values()}
+            | set(self._blocked_versions)
+        )
+        activity = {
+            version: self.version_activity(version) for version in activity_versions
+        }
         return {
             "pending": len(pending),
             "pending_by_version": by_version,
+            "blocked_versions": sorted(self._blocked_versions),
+            "version_activity": activity,
             "max_batch_size": self.max_batch_size,
             "batch_wait_ms": round(self.batch_wait_s * 1000, 3),
             "dispatch_guard_ms": round(self.dispatch_guard_s * 1000, 3),

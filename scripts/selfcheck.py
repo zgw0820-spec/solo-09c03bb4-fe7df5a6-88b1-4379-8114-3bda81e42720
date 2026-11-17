@@ -156,12 +156,106 @@ def main() -> int:
     check(slow["status"] == "timeout", "demo slow email timed out")
     check(client.get("/healthz").json()["active_model"] == "v2", "demo left v2 active")
 
+    print("8. model retirement lifecycle")
+    # Demo left v2 active; the active model cannot be retired until another
+    # version takes over.
+    check(
+        client.post("/api/models/v2/retire").status_code == 409,
+        "retiring the active model is refused",
+    )
+    # Start a full v2 batch with one slow email while v2 is still active, then
+    # move the pointer to v1 and retire v2 so the late scoring thread is still
+    # running when retirement begins.
+    slow_job = client.post(
+        "/api/jobs",
+        json={
+            "label": "retire-drain",
+            "emails": [
+                {"text": "SLOW crypto invest", "deadline_ms": 300, "simulate_latency_ms": 700},
+                {"text": "parcel delivery fee", "deadline_ms": 900},
+                {"text": "parcel delivery fee", "deadline_ms": 900},
+                {"text": "parcel delivery fee", "deadline_ms": 900},
+            ],
+        },
+    ).json()
+    # Wait until the batch is actually executing (not merely queued) so every
+    # entry has already pinned v2 before the pointer moves away.
+    wait_until(
+        client,
+        lambda: client.get("/api/state").json()["worker"]["version_activity"]
+        .get("v2", {})
+        .get("executing", 0)
+        >= 1,
+    )
+    client.post("/api/model", json={"version": "v1"})
+    retire = client.post("/api/models/v2/retire")
+    check(retire.status_code == 202, f"v2 retirement accepted (202), got {retire.status_code}")
+    check(retire.json()["state"] == "retiring", "v2 enters retiring state")
+
+    # Switch-back and new bindings are rejected while retiring.
+    check(
+        client.post("/api/model", json={"version": "v2"}).status_code == 409,
+        "switch back to retiring v2 is refused",
+    )
+    check(
+        client.post("/api/models/v2/retire").status_code == 409,
+        "retiring v2 twice is refused",
+    )
+    state = client.get("/api/state").json()
+    check(
+        state["retirements"]["v2"]["activity"]["late_threads"] >= 1,
+        "late scoring thread keeps v2 in retiring state",
+    )
+    # Wait specifically for the slow email to time out, and verify pinning
+    # *before* the drain can finish and unload v2.
+    late = None
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        slow_done = wait_job(client, slow_job["id"], timeout=2)
+        late = next(e for e in slow_done["entries"] if e["simulate_latency_ms"] > 0)
+        if late["status"] == "timeout":
+            break
+        time.sleep(0.05)
+    check(late is not None and late["status"] == "timeout", "slow retired-model email timed out")
+    check(late["model_version"] == "v2", "already accepted email kept its pinned v2")
+    check(late["late_result_discarded"] is True, "late result discarded, timeout not flipped")
+
+    # Once every queued/executing/late item drains, v2 unloads automatically.
+    unloaded = wait_until(
+        client,
+        lambda: client.get("/api/state").json()["retirements"]["v2"]["state"] == "unloaded",
+    )
+    check(unloaded, "v2 unloaded only after the late thread finished")
+    health = client.get("/healthz").json()
+    check("v2" not in health["models"], "v2 removed from runtime registry")
+    check(
+        client.post("/api/model", json={"version": "v2"}).status_code == 409,
+        "switching to an unloaded version stays refused",
+    )
+    views = {m["version"]: m for m in client.get("/api/models").json()["models"]}
+    check(views["v2"]["state"] == "unloaded" and views["v2"]["unloaded_at"], "unloaded tombstone exposed")
+    # v1 still classifies correctly.
+    still = client.post(
+        "/api/classify",
+        json={"label": "after-retire", "emails": [{"text": SPAM, "deadline_ms": 800}]},
+    ).json()
+    check(still["ok"] == 1 and still["entries"][0]["model_version"] == "v1", "v1 classification intact after v2 unload")
+
     print()
     if failures:
         print(f"{len(failures)} check(s) failed")
         return 1
     print("all checks passed")
     return 0
+
+
+def wait_until(client, predicate, timeout: float = 8.0, tick: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(tick)
+    return predicate()
 
 
 if __name__ == "__main__":

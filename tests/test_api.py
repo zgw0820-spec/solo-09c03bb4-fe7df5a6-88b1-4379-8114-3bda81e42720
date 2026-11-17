@@ -16,10 +16,8 @@ from app import main as main_module  # noqa: E402
 
 @pytest.fixture()
 def client():
-    # Reset process-global state per test.
-    main_module.jobs.clear()
-    main_module.switches.clear()
-    main_module.active_version = main_module.registry.default_version
+    # Reset process-global state per test, including any unloaded models.
+    main_module.reset_runtime()
     main_module.worker.metrics.update(
         {key: 0 for key in main_module.worker.metrics}
     )

@@ -174,5 +174,24 @@ class ModelRegistry:
         except KeyError:
             raise KeyError(f"unknown model version {version!r}; known: {self.versions}") from None
 
+    def unload(self, version: str) -> LinearBoWModel:
+        """Remove a retired version from the runtime registry.
+
+        Only call this once every queued, executing and late scoring thread
+        for ``version`` has drained: nothing may resolve a result through the
+        model after it is gone.  Historical metrics and already-settled
+        results keep the version *string*; they never touch the runtime model
+        again.
+        """
+        try:
+            model = self._models.pop(version)
+        except KeyError:
+            raise KeyError(
+                f"model version {version!r} is not loaded; known: {self.versions}"
+            ) from None
+        if self.default_version == version:
+            self.default_version = sorted(self._models)[0]
+        return model
+
     def __contains__(self, version: object) -> bool:
         return version in self._models

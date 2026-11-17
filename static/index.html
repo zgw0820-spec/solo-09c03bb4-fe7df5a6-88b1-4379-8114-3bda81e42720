@@ -34,7 +34,19 @@
         </div>
         <p class="small muted" style="margin:10px 0 0">
           切换仅影响 <b>此后接单</b> 的邮件；已在队列中的请求继续使用接单时的模型版本。
+          非现行版本可发起 <b>退役</b>：退役中禁止切回与新邮件绑定，待排队、执行与迟到线程全部结束后自动卸载。
         </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型退役</h2>
+          <span class="spacer"></span>
+          <span class="small muted">退役中 → 已卸载</span>
+        </div>
+        <div id="retirements">
+          <div class="empty">暂无退役中的模型</div>
+        </div>
       </div>
 
       <div class="panel">

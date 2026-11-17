@@ -80,6 +80,29 @@ function statusPill(status) {
   return el("span", `pill ${cls}`, label);
 }
 
+function reasonLabel(reason) {
+  const map = {
+    model_retired: "模型已退役，未绑定",
+    deadline_exceeded_before_dispatch: "派发前超时",
+    deadline_exceeded_during_batch: "执行中超时",
+    worker_stopped_before_dispatch: "停机前未派发",
+    worker_stopped_during_batch: "停机中断",
+    internal_error: "内部错误",
+    gateway_error: "网关错误",
+  };
+  return map[reason] || reason || "";
+}
+
+function lifecyclePill(state) {
+  const map = {
+    loaded: ["ok", "在用"],
+    retiring: ["timeout", "退役中"],
+    unloaded: ["error", "已卸载"],
+  };
+  const [cls, label] = map[state] || ["pending", state || "—"];
+  return el("span", `pill ${cls}`, label);
+}
+
 function versionPill(version) {
   if (!version) return el("span", "pill pending", "—");
   return el("span", `pill ${version === "v1" ? "v1" : "v2"}`, version);
@@ -206,33 +229,80 @@ function renderModels() {
   const grid = $("#model-grid");
   grid.textContent = "";
   for (const model of state.models) {
-    const card = el("div", "model-card" + (model.version === state.active ? " current" : ""));
+    const lifecycle = model.state || "loaded";
+    const card = el(
+      "div",
+      "model-card" +
+        (model.version === state.active ? " current" : "") +
+        (lifecycle === "unloaded" ? " unloaded" : "")
+    );
     const row = el("div", "row");
     row.append(versionPill(model.version));
-    row.append(el("span", "small muted", `阈值 ${model.threshold}`));
+    row.append(lifecyclePill(lifecycle));
+    row.append(el("span", "small muted", `阈值 ${model.threshold ?? "—"}`));
     row.append(el("span", "spacer"));
-    if (model.version === state.active) {
+    if (lifecycle === "unloaded") {
+      row.append(el("span", "badge bad", "已卸载"));
+    } else if (lifecycle === "retiring") {
+      row.append(el("span", "badge warn", "退役中 · 等待排空"));
+    } else if (model.version === state.active) {
       row.append(el("span", "badge active", "现行"));
     } else {
-      const btn = el("button", "tiny primary", "切换到此版本");
-      btn.onclick = () => switchModel(model.version);
-      row.append(btn);
+      const switchBtn = el("button", "tiny primary", "切换到此版本");
+      switchBtn.onclick = () => switchModel(model.version);
+      row.append(switchBtn);
+      const retireBtn = el("button", "tiny danger", "退役此版本");
+      retireBtn.onclick = () => retireModel(model.version);
+      row.append(retireBtn);
     }
     card.append(row);
     card.append(el("div", "desc", model.description || ""));
-    card.append(el("div", "small muted", `词表 ${model.vocabulary_size} 项`));
+    card.append(
+      el("div", "small muted", `词表 ${model.vocabulary_size ?? "—"} 项`)
+    );
+    if (lifecycle === "retiring") {
+      const note = el("div", "small warn-note", "退役中：新邮件与切换均被拒绝，等待排队/执行/迟到线程结束后卸载。");
+      card.append(note);
+    }
+    if (lifecycle === "unloaded") {
+      const note = el(
+        "div",
+        "small muted",
+        `已于 ${model.unloaded_at ? model.unloaded_at.slice(11, 19) : "—"} 卸载，运行时不再占用推理内存。`
+      );
+      card.append(note);
+    }
 
     const terms = el("div", "terms");
-    for (const term of model.top_spam_terms.slice(0, 6)) {
+    for (const term of (model.top_spam_terms || []).slice(0, 6)) {
       terms.append(el("span", "term spam", `+${term.term} ${term.weight}`));
     }
-    for (const term of model.top_ham_terms.slice(0, 4)) {
+    for (const term of (model.top_ham_terms || []).slice(0, 4)) {
       terms.append(el("span", "term ham", `${term.term} ${term.weight}`));
     }
     card.append(terms);
     grid.append(card);
   }
   updateActiveBadge(state.active);
+}
+
+async function retireModel(version) {
+  const ok = window.confirm(
+    `确认退役模型 ${version}？\n\n` +
+      "· 退役开始后禁止再切换到该版本，新邮件也不得使用它；\n" +
+      "· 已接单邮件仍按原模型与各自截止时间结算；\n" +
+      "· 排队、执行与迟到线程全部结束后才会卸载运行时模型。"
+  );
+  if (!ok) return;
+  try {
+    const data = await api(`/api/models/${version}/retire`, { method: "POST" });
+    toast(`模型 ${version} 已进入「退役中」，排空后自动卸载`);
+    state.retirements = data.models;
+    await loadModels();
+    await refreshState();
+  } catch (error) {
+    toast(`退役失败：${error.message}`, true);
+  }
 }
 
 async function switchModel(version) {
@@ -260,14 +330,54 @@ async function refreshState() {
   }
   state.active = data.active_model;
   updateActiveBadge(data.active_model);
+  // Keep model cards in sync with retirement transitions (retiring ->
+  // unloaded) even without a manual refresh click.
+  if (data.model_views) {
+    state.models = data.model_views;
+    renderModels();
+  }
   const worker = data.worker;
   $("#pending-badge").textContent = `队列 ${worker.pending}`;
   $("#worker-config").textContent =
     `批 ≤${worker.max_batch_size} · 等待 ≤${worker.batch_wait_ms}ms · 提前 ${worker.dispatch_guard_ms}ms`;
 
+  renderRetirements(data.retirements || {});
   renderMetrics(worker);
   renderVersionMetrics(worker);
   renderBatches(worker.recent_batches);
+}
+
+function renderRetirements(retirements) {
+  const box = $("#retirements");
+  box.textContent = "";
+  const entries = Object.entries(retirements);
+  if (!entries.length) {
+    box.append(el("div", "empty", "暂无退役中的模型"));
+    return;
+  }
+  for (const [version, rec] of entries) {
+    const row = el("div", "retire-row");
+    row.append(versionPill(version));
+    row.append(lifecyclePill(rec.state));
+    if (rec.state === "retiring") {
+      const a = rec.activity || {};
+      row.append(
+        el(
+          "span",
+          "small mono",
+          `排队 ${a.queued ?? 0} · 执行 ${a.executing ?? 0} · 迟到线程 ${a.late_threads ?? 0}`
+        )
+      );
+      row.append(el("span", "spacer"));
+      row.append(el("span", "small muted", `退役于 ${(rec.retired_at || "").slice(11, 19)}`));
+    } else {
+      row.append(el("span", "spacer"));
+      row.append(
+        el("span", "small muted", `卸载于 ${(rec.unloaded_at || "").slice(11, 19)}`)
+      );
+    }
+    box.append(row);
+  }
 }
 
 function renderMetrics(worker) {
@@ -440,7 +550,7 @@ function buildJobCard(job) {
     tr.append(el("td", "num", entry.latency_ms === null || entry.latency_ms === undefined ? "—" : `${fmt(entry.latency_ms, 1)}ms`));
     const noteCell = el("td", "small muted");
     const notes = [];
-    if (entry.reason) notes.push(entry.reason);
+    if (entry.reason) notes.push(reasonLabel(entry.reason));
     if (entry.late_result_discarded) notes.push("迟到结果已丢弃");
     if (entry.simulate_latency_ms) notes.push(`模拟延迟 ${entry.simulate_latency_ms}ms`);
     if (entry.submit_after_ms) notes.push(`错峰 ${entry.submit_after_ms}ms`);

@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.batching import Worker  # noqa: E402
+from app.batching import ModelRetiredError, Worker  # noqa: E402
 from app.model import LinearBoWModel, ModelRegistry, Prediction  # noqa: E402
 
 
@@ -472,3 +472,166 @@ def test_model_scores_are_deterministic():
     # v2 must be a genuinely different model.
     assert registry.get("v1").weights.shape != registry.get("v2").weights.shape
     assert registry.get("v1").predict(text) != registry.get("v2").predict(text)
+
+
+# ---------------------------------------------------------------------
+# retirement coordination
+# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_blocked_version_rejects_new_submissions_but_settles_old():
+    worker = Worker(make_registry(), max_batch_size=4, batch_wait_ms=20)
+    await worker.start()
+    try:
+        old = asyncio.create_task(
+            worker.submit(
+                text="free spam",
+                model_version="v1",
+                deadline_ms=800,
+                request_id="old",
+                request_batch_id="r",
+            )
+        )
+        await asyncio.sleep(0.02)
+        worker.block_version("v1")
+        with pytest.raises(ModelRetiredError):
+            await worker.submit(
+                text="free spam",
+                model_version="v1",
+                deadline_ms=800,
+                request_id="new",
+                request_batch_id="r",
+            )
+        # The already accepted request still settles with its pinned version.
+        result = await asyncio.wait_for(old, timeout=3)
+        assert result["model_version"] == "v1"
+        assert result["status"] == "ok"
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_wait_drained_counts_queued_executing_and_late_threads():
+    def slow_scorer(model: LinearBoWModel, text: str) -> Prediction:
+        if "SLOW" in text:
+            time.sleep(0.4)
+        return model.predict(text)
+
+    worker = Worker(
+        make_registry(), max_batch_size=4, batch_wait_ms=10, scorer=slow_scorer
+    )
+    await worker.start()
+    try:
+        # Full batch dispatches immediately; the slow thread outlives its
+        # 150ms deadline and keeps running as a late thread.
+        slow_task = asyncio.create_task(
+            worker.submit(
+                text="SLOW free spam",
+                model_version="v1",
+                deadline_ms=150,
+                request_id="slow",
+                request_batch_id="drain",
+            )
+        )
+        mate_tasks = [
+            asyncio.create_task(
+                worker.submit(
+                    text="free spam",
+                    model_version="v1",
+                    deadline_ms=800,
+                    request_id=f"mate-{i}",
+                    request_batch_id="drain",
+                )
+            )
+            for i in range(3)
+        ]
+        await asyncio.sleep(0.03)
+        assert worker.version_activity("v1")["total"] >= 1
+        assert worker.version_activity("v1")["executing"] >= 1
+
+        worker.block_version("v1")
+        drained = asyncio.create_task(worker.wait_drained("v1"))
+        # It must not return while work is still in flight.
+        done, _pending = await asyncio.wait({drained}, timeout=0.2)
+        assert not done, "wait_drained returned while batches were executing"
+
+        results = await asyncio.wait_for(
+            asyncio.gather(slow_task, *mate_tasks), timeout=5
+        )
+        slow = next(r for r in results if r["request_id"] == "slow")
+        assert slow["status"] == "timeout"
+
+        # Even after all requests resolve, the late scoring thread (~0.4s)
+        # keeps wait_drained pending until it truly finishes.
+        await asyncio.wait_for(drained, timeout=3)
+        assert worker.version_activity("v1")["total"] == 0
+        assert not worker._scorer_threads
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_drain_event_returns_immediately_when_idle():
+    worker = Worker(make_registry())
+    await worker.start()
+    try:
+        worker.block_version("v2")
+        # Nothing ever used v2: draining must complete on the first pass.
+        await asyncio.wait_for(worker.wait_drained("v2"), timeout=1.0)
+        assert worker.version_activity("v2")["total"] == 0
+    finally:
+        await worker.stop()
+
+
+def test_registry_unload_removes_runtime_model():
+    registry = make_registry()
+    assert "v1" in registry
+    model = registry.unload("v1")
+    assert model.version == "v1"
+    assert "v1" not in registry
+    with pytest.raises(KeyError):
+        registry.get("v1")
+    # The remaining model keeps serving.
+    assert registry.get("v2").version == "v2"
+    with pytest.raises(KeyError):
+        registry.unload("v1")
+
+
+@pytest.mark.asyncio
+async def test_timed_out_scoring_future_stays_tracked_until_thread_returns():
+    """Regression: wait_for must not mark the executor future done early.
+
+    Without ``asyncio.shield`` the timeout cancels the await and the future
+    reports ``done()`` while the OS thread is still sleeping, which would let
+    retirement unload the model under a live scoring thread.
+    """
+    def slow_scorer(model: LinearBoWModel, text: str) -> Prediction:
+        if "SLOW" in text:
+            time.sleep(0.35)
+        return model.predict(text)
+
+    worker = Worker(make_registry(), batch_wait_ms=10, scorer=slow_scorer)
+    await worker.start()
+    try:
+        task = asyncio.create_task(
+            worker.submit(
+                text="SLOW free spam",
+                model_version="v1",
+                deadline_ms=120,
+                request_id="shielded",
+                request_batch_id="r",
+            )
+        )
+        # Wait for the timeout to resolve the request.
+        result = await asyncio.wait_for(task, timeout=3)
+        assert result["status"] == "timeout"
+        # The request is settled but the ~0.35s thread is still running and
+        # must remain tracked as a late thread.
+        assert worker.version_activity("v1")["late_threads"] == 1
+        tracked = worker._scorer_threads["shielded"][1]
+        assert not tracked.done()
+        # Once the thread truly returns the tracked future completes and the
+        # version fully drains.
+        await asyncio.wait_for(worker.wait_drained("v1"), timeout=3)
+        assert "shielded" not in worker._scorer_threads
+    finally:
+        await worker.stop()

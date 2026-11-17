@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .batching import Worker
+from .batching import ModelRetiredError, Worker
 from .model import ModelRegistry
 
 logger = logging.getLogger("moderation")
@@ -52,6 +52,13 @@ worker = Worker(
 
 active_version: str = registry.default_version
 switches: list[dict[str, Any]] = []
+# version -> lifecycle record.  A version is either "loaded" (absent here),
+# "retiring" (blocked, draining queued/executing/late work) or "unloaded"
+# (removed from the runtime registry).
+retirements: dict[str, dict[str, Any]] = {}
+# Serialises switch vs. retire decisions: whichever acquires the lock first
+# wins, the other is rejected explicitly instead of partially applying.
+ops_lock = asyncio.Lock()
 jobs: dict[str, dict[str, Any]] = {}
 _background_tasks: set[asyncio.Task] = set()
 
@@ -87,6 +94,55 @@ def _set_active(version: str, *, source: str, note: str | None = None) -> dict[s
         del switches[: len(switches) - 100]
     logger.info("active model %s -> %s (%s)", previous, version, source)
     return event
+
+
+def _model_lifecycle(version: str) -> str:
+    record = retirements.get(version)
+    return record["state"] if record else ("loaded" if version in registry else "unknown")
+
+
+def _model_view() -> list[dict[str, Any]]:
+    """Models for the console: loaded models plus unloaded tombstone records."""
+    views: list[dict[str, Any]] = []
+    for version in registry.versions:
+        model = registry.get(version)
+        order = model.weights.argsort()
+        views.append(
+            {
+                "version": version,
+                "state": _model_lifecycle(version),
+                "description": model.description,
+                "threshold": model.threshold,
+                "vocabulary_size": len(model.vocabulary),
+                "top_spam_terms": [
+                    {"term": model.vocabulary[i], "weight": round(float(model.weights[i]), 4)}
+                    for i in order[::-1][:8]
+                ],
+                "top_ham_terms": [
+                    {"term": model.vocabulary[i], "weight": round(float(model.weights[i]), 4)}
+                    for i in order[:8]
+                ],
+                "retired_at": (retirements.get(version) or {}).get("retired_at"),
+                "unloaded_at": (retirements.get(version) or {}).get("unloaded_at"),
+            }
+        )
+    for version, record in retirements.items():
+        if version in registry:
+            continue
+        views.append(
+            {
+                "version": version,
+                "state": record["state"],
+                "description": record.get("description", ""),
+                "threshold": record.get("threshold"),
+                "vocabulary_size": record.get("vocabulary_size"),
+                "top_spam_terms": [],
+                "top_ham_terms": [],
+                "retired_at": record.get("retired_at"),
+                "unloaded_at": record.get("unloaded_at"),
+            }
+        )
+    return views
 
 
 # ---------------------------------------------------------------------------
@@ -207,26 +263,9 @@ async def _run_job(job: Job) -> None:
             if delay > 0:
                 await asyncio.sleep(delay)
             # ---- intake: pin the version that is active right now ----
-            version = active_version
-            entry.model_version = version
-            entry.accepted_at = _now_iso()
-            job.events.append(
-                {
-                    "at": entry.accepted_at,
-                    "type": "accepted",
-                    "index": entry.index,
-                    "model_version": version,
-                }
-            )
-            coro = worker.submit(
-                text=entry.text,
-                model_version=version,
-                deadline_ms=entry.deadline_ms,
-                request_id=f"{job.id}-{entry.index}",
-                request_batch_id=job.id,
-                latency_sim_ms=entry.simulate_latency_ms,
-            )
-            tasks.append(asyncio.create_task(coro))
+            task = _accept_entry(job, entry)
+            if task is not None:
+                tasks.append(task)
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for entry, result in zip(job.entries, results):
             if isinstance(result, BaseException):
@@ -271,6 +310,58 @@ def _new_job(payload: SubmitIn, *, prefix: str = "job") -> Job:
     return job
 
 
+def _retired_entry_result(job: Job, entry: JobEntry, version: str) -> dict:
+    return {
+        "request_id": f"{job.id}-{entry.index}",
+        "request_batch_id": job.id,
+        "model_version": version,
+        "status": "error",
+        "reason": "model_retired",
+        "score": None,
+        "label": None,
+        "threshold": None,
+        "deadline_ms": entry.deadline_ms,
+        "latency_ms": 0.0,
+        "phase": "resolved",
+        "late_result_discarded": False,
+        "submitted_at": entry.accepted_at,
+        "completed_at": _now_iso(),
+    }
+
+
+def _accept_entry(job: Job, entry: JobEntry) -> asyncio.Task | None:
+    """Intake one entry: pin the active version, honoring retirement blocks.
+
+    Returns the worker task to await, or ``None`` when the pinned version was
+    retired before this entry was accepted (the entry is settled as an error
+    and no new mail is bound to the retired model).
+    """
+    version = active_version
+    entry.model_version = version
+    entry.accepted_at = _now_iso()
+    job.events.append(
+        {
+            "at": entry.accepted_at,
+            "type": "accepted",
+            "index": entry.index,
+            "model_version": version,
+        }
+    )
+    if worker.is_blocked(version) or version not in registry:
+        entry.result = _retired_entry_result(job, entry, version)
+        return None
+    return asyncio.create_task(
+        worker.submit(
+            text=entry.text,
+            model_version=version,
+            deadline_ms=entry.deadline_ms,
+            request_id=f"{job.id}-{entry.index}",
+            request_batch_id=job.id,
+            latency_sim_ms=entry.simulate_latency_ms,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -311,38 +402,93 @@ async def healthz() -> dict:
 
 @app.get("/api/models")
 async def list_models() -> dict:
-    models = []
-    for version in registry.versions:
-        model = registry.get(version)
-        order = model.weights.argsort()
-        models.append(
-            {
-                "version": version,
-                "description": model.description,
-                "threshold": model.threshold,
-                "vocabulary_size": len(model.vocabulary),
-                "top_spam_terms": [
-                    {"term": model.vocabulary[i], "weight": round(float(model.weights[i]), 4)}
-                    for i in order[::-1][:8]
-                ],
-                "top_ham_terms": [
-                    {"term": model.vocabulary[i], "weight": round(float(model.weights[i]), 4)}
-                    for i in order[:8]
-                ],
-            }
-        )
-    return {"active": active_version, "models": models}
+    return {"active": active_version, "models": _model_view()}
 
 
 @app.post("/api/model")
 async def switch_model(payload: SwitchIn) -> dict:
-    if payload.version not in registry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"未知模型版本 {payload.version!r}，可用: {registry.versions}",
-        )
-    event = _set_active(payload.version, source="console", note=payload.note)
-    return {"active": active_version, "event": event, "models": registry.versions}
+    async with ops_lock:
+        lifecycle = _model_lifecycle(payload.version)
+        if lifecycle == "unknown":
+            raise HTTPException(
+                status_code=404,
+                detail=f"未知模型版本 {payload.version!r}，可用: {registry.versions}",
+            )
+        if lifecycle in ("retiring", "unloaded"):
+            # First-writer-wins: a retirement decided first cannot be undone
+            # by switching back to the retired version.
+            raise HTTPException(
+                status_code=409,
+                detail=f"模型 {payload.version} 已{_lifecycle_zh(lifecycle)}，禁止切换到该版本",
+            )
+        event = _set_active(payload.version, source="console", note=payload.note)
+    return {"active": active_version, "event": event, "models": _model_view()}
+
+
+def _lifecycle_zh(state: str) -> str:
+    return {"retiring": "退役中", "unloaded": "退役并已卸载", "loaded": "在用"}.get(state, state)
+
+
+@app.post("/api/models/{version}/retire", status_code=202)
+async def retire_model(version: str) -> dict:
+    """Retire a non-active model and unload it once all old work has drained.
+
+    The retirement starts immediately (state -> retiring, new submissions and
+    switches to it are rejected).  A background task waits for every queued
+    request, executing batch and late scoring thread of that version to
+    finish, then removes the runtime model (state -> unloaded).
+    """
+    async with ops_lock:
+        if version not in registry or version in retirements:
+            if version in retirements:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"模型 {version} 已处于「{_lifecycle_zh(retirements[version]['state'])}」状态",
+                )
+            raise HTTPException(
+                status_code=404,
+                detail=f"未知模型版本 {version!r}，可用: {registry.versions}",
+            )
+        if version == active_version:
+            raise HTTPException(
+                status_code=409,
+                detail="现行模型不能退役：请先切换到其他版本，再发起退役",
+            )
+        model = registry.get(version)
+        record = {
+            "state": "retiring",
+            "retired_at": _now_iso(),
+            "unloaded_at": None,
+            "description": model.description,
+            "threshold": model.threshold,
+            "vocabulary_size": len(model.vocabulary),
+        }
+        retirements[version] = record
+        worker.block_version(version)
+        logger.info("model %s retirement started", version)
+
+    async def drain_and_unload() -> None:
+        try:
+            await worker.wait_drained(version)
+            async with ops_lock:
+                if version not in registry:
+                    return
+                registry.unload(version)
+                record["state"] = "unloaded"
+                record["unloaded_at"] = _now_iso()
+            logger.info("model %s unloaded after clean drain", version)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("retirement drain failed for %s", version)
+
+    _spawn(drain_and_unload(), name=f"retire-{version}")
+    return {
+        "version": version,
+        "state": "retiring",
+        "activity": worker.version_activity(version),
+        "models": _model_view(),
+    }
 
 
 @app.get("/api/state")
@@ -350,6 +496,16 @@ async def state() -> dict:
     return {
         "active_model": active_version,
         "models": registry.versions,
+        "model_views": _model_view(),
+        "retirements": {
+            version: {
+                **record,
+                "activity": worker.version_activity(version)
+                if version in registry
+                else {"queued": 0, "executing": 0, "late_threads": 0, "total": 0},
+            }
+            for version, record in retirements.items()
+        },
         "switches": list(reversed(switches[-20:])),
         "worker": worker.snapshot(),
         "config": {
@@ -369,6 +525,11 @@ async def state() -> dict:
 
 @app.post("/api/jobs", status_code=202)
 async def create_job(payload: SubmitIn) -> dict:
+    if worker.is_blocked(active_version) or active_version not in registry:
+        raise HTTPException(
+            status_code=409,
+            detail=f"现行模型 {active_version} 已退役，新邮件不得绑定到该版本",
+        )
     job = _new_job(payload)
     _spawn(_run_job(job), name=f"job-runner-{job.id}")
     return job.public()
@@ -377,6 +538,11 @@ async def create_job(payload: SubmitIn) -> dict:
 @app.post("/api/classify")
 async def classify(payload: SubmitIn) -> dict:
     """Synchronous convenience endpoint: accept all emails and await results."""
+    if worker.is_blocked(active_version) or active_version not in registry:
+        raise HTTPException(
+            status_code=409,
+            detail=f"现行模型 {active_version} 已退役，新邮件不得绑定到该版本",
+        )
     job = _new_job(payload, prefix="sync")
     await _run_job(job)
     return job.public()
@@ -412,7 +578,14 @@ async def demo_interleaved() -> dict:
     """
     if "v1" not in registry or "v2" not in registry:
         raise HTTPException(status_code=409, detail="demo 需要 v1 与 v2 两个模型")
-    _set_active("v1", source="demo", note="演示开始：先使用 v1")
+    async with ops_lock:
+        lifecycle = _model_lifecycle("v1")
+        if lifecycle != "loaded":
+            raise HTTPException(
+                status_code=409,
+                detail=f"演示需要 v1 处于在用状态，当前为「{_lifecycle_zh(lifecycle)}」",
+            )
+        _set_active("v1", source="demo", note="演示开始：先使用 v1")
 
     old_emails = [
         EmailIn(
@@ -441,6 +614,7 @@ async def demo_interleaved() -> dict:
     ]
     combined = SubmitIn(label="切换交错演示", emails=old_emails + new_emails)
     job = _new_job(combined, prefix="demo")
+    n_old = len(old_emails)
 
     async def orchestrate() -> None:
         job.status = "running"
@@ -448,34 +622,15 @@ async def demo_interleaved() -> dict:
         start = time.monotonic()
         tasks: list[asyncio.Task] = []
         try:
-            for entry in job.entries[: len(old_emails)]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
+            for entry in job.entries[:n_old]:
+                task = _accept_entry(job, entry)
+                if task is not None:
+                    tasks.append(task)
             await asyncio.sleep(max(0.0, start + 0.06 - time.monotonic()))
-            event = _set_active(
-                "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
-            )
+            async with ops_lock:
+                event = _set_active(
+                    "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
+                )
             job.events.append(
                 {
                     "at": event["at"],
@@ -486,32 +641,14 @@ async def demo_interleaved() -> dict:
                 }
             )
             await asyncio.sleep(max(0.0, start + 0.10 - time.monotonic()))
-            for entry in job.entries[len(old_emails) :]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
+            for entry in job.entries[n_old:]:
+                task = _accept_entry(job, entry)
+                if task is not None:
+                    tasks.append(task)
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for entry, result in zip(job.entries, results):
+            for entry, result in zip(
+                (e for e in job.entries if e.result is None), results
+            ):
                 if isinstance(result, BaseException):
                     entry.result = {
                         "status": "error",
@@ -536,3 +673,25 @@ async def demo_interleaved() -> dict:
 @app.exception_handler(ValueError)
 async def value_error_handler(_request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(ModelRetiredError)
+async def retired_error_handler(_request, exc: ModelRetiredError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def reset_runtime() -> None:
+    """Restore process-global singletons to their boot state (tests only).
+
+    Reloads the registry from disk so previously unloaded models come back,
+    clears retirement records and re-enables every blocked worker version.
+    """
+    global active_version, registry
+    registry = ModelRegistry.load_dir(MODELS_DIR, os.environ.get("DEFAULT_MODEL_VERSION"))
+    worker.registry = registry
+    for version in list(worker._blocked_versions):  # noqa: SLF001 - test seam
+        worker.unblock_version(version)
+    retirements.clear()
+    switches.clear()
+    jobs.clear()
+    active_version = registry.default_version

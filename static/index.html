@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>垃圾邮件审核 · 模型版本与批处理控制台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>垃圾邮件审核控制台</h1>
+    <span class="badge" id="active-badge">现行模型 · …</span>
+    <span class="badge" id="pending-badge">队列 0</span>
+    <span class="badge mono" id="clock">--:--:--</span>
+    <span class="spacer"></span>
+    <span class="legend">
+      <span><b>版本固定</b> 接单时快照</span>
+      <span><b>批 ≤4</b> 等待 ≤200ms</span>
+      <span><b>紧截止</b> 提前发批</span>
+    </span>
+  </header>
+
+  <main>
+    <!-- ---------------------------------------------------------- -->
+    <section>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型切换</h2>
+          <span class="spacer"></span>
+          <button class="tiny ghost" id="refresh-models">刷新</button>
+        </div>
+        <div class="model-grid" id="model-grid">
+          <div class="empty">加载中…</div>
+        </div>
+        <p class="small muted" style="margin:10px 0 0">
+          切换仅影响 <b>此后接单</b> 的邮件；已在队列中的请求继续使用接单时的模型版本。
+        </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>提交邮件</h2>
+          <span class="spacer"></span>
+          <span class="badge mono" id="submission-count">0 / 16</span>
+        </div>
+        <div class="email-list" id="email-list"></div>
+        <div class="toolbar">
+          <button id="add-email" class="tiny">+ 添加邮件</button>
+          <button id="fill-demo" class="tiny ghost">填充示例</button>
+          <button id="clear-emails" class="tiny ghost">清空</button>
+          <span style="flex:1"></span>
+          <button class="primary" id="submit">提交审核</button>
+        </div>
+        <p class="small muted" id="submit-hint" style="margin:10px 0 0">
+          每封邮件独立指定 100～1000ms 截止时间。可选“错峰提交”与“模拟推理延迟”用于测试超时。
+        </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>交错演示</h2>
+        </div>
+        <p class="small muted" style="margin:0 0 10px">
+          一键触发：先以 v1 接单两封 → 切换 v2 → 再提交三封（其中一封模拟慢推理）。
+          可直接观察「旧请求用旧模型、新请求立即用新模型、批内不混版本、迟到结果不改判成功」。
+        </p>
+        <button class="primary" id="run-demo">运行交错演示</button>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- -->
+    <section>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>工作器状态</h2>
+          <span class="spacer"></span>
+          <span class="small muted mono" id="worker-config">—</span>
+        </div>
+        <div class="metrics" id="metrics"></div>
+        <div style="margin-top:12px">
+          <h3>按模型版本</h3>
+          <table>
+            <thead>
+              <tr><th>版本</th><th>已接单</th><th>成功</th><th>超时</th><th>批次</th></tr>
+            </thead>
+            <tbody id="version-metrics"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>最近批次</h2>
+          <span class="spacer"></span>
+          <span class="small muted">每批 ≤4，同批仅一个版本</span>
+        </div>
+        <div class="batch-list" id="batch-list">
+          <div class="empty">尚无批次</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>审核结果</h2>
+          <span class="spacer"></span>
+          <label class="small muted" style="display:flex;gap:6px;align-items:center">
+            <input type="checkbox" id="auto-refresh" checked /> 自动刷新
+          </label>
+        </div>
+        <div id="jobs">
+          <div class="empty">尚未提交任何邮件</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
